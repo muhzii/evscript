@@ -1,7 +1,6 @@
 extern crate clap;
 #[macro_use]
 extern crate dyon;
-#[macro_use]
 extern crate evdev;
 extern crate nix;
 extern crate rusty_sandbox;
@@ -9,12 +8,11 @@ extern crate rusty_sandbox;
 extern crate serde_derive;
 extern crate toml;
 
-use std::{env, fs, io, path};
+use std::{env, fs, io};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use evdev::{data, raw, uinput, Device};
 use nix::unistd;
-use nix::poll::{poll, PollFlags as EventFlags, PollFd};
+use evdev::{uinput, Device, Key, AttributeSet, InputEvent, EventType};
 use dyon::{error, load_str, Array, Dfn, Lt, Module, Runtime, RustObject, Type, Variable};
 
 macro_rules! module_add {
@@ -71,28 +69,6 @@ impl ScriptSource {
 }
 
 #[derive(Default, Deserialize)]
-struct DeviceConfig {
-    name: Option<String>,
-    bustype: Option<u16>,
-    vendor: Option<u16>,
-    product: Option<u16>,
-    version: Option<u16>,
-}
-
-impl Into<raw::uinput_setup> for DeviceConfig {
-    fn into(self) -> raw::uinput_setup {
-        let mut conf = raw::uinput_setup::default();
-        conf.set_name(self.name.unwrap_or("Devicey McDeviceFace".into()))
-            .expect("set_name");
-        conf.id.bustype = self.bustype.unwrap_or(0x6);
-        conf.id.vendor = self.vendor.unwrap_or(0x69);
-        conf.id.product = self.product.unwrap_or(69);
-        conf.id.version = self.version.unwrap_or(0);
-        conf
-    }
-}
-
-#[derive(Default, Deserialize)]
 struct EventsConfig {
     keys: Option<Vec<String>>,
     // TODO: other events
@@ -100,55 +76,47 @@ struct EventsConfig {
 
 #[derive(Default, Deserialize)]
 struct ScriptConfig {
-    device: Option<DeviceConfig>,
     events: EventsConfig,
 }
 
-pub struct InputEvent {
+pub struct ScriptInputEvent {
     pub kind: u32,
     pub code: u32,
     pub value: u32,
-    pub device_idx: u32,
 }
 
-dyon_obj!{InputEvent { kind, code, value, device_idx }}
+dyon_obj!{ScriptInputEvent { kind, code, value }}
 
 dyon_fn!{fn device_name(obj: RustObject) -> String {
     let mut guard = obj.lock().expect(".lock()");
     let dev = guard.downcast_mut::<Device>().expect(".downcast_mut()");
-    let name = std::str::from_utf8(dev.name().to_bytes()).expect("from_utf8()").to_owned();
-    name
+    dev.name().expect("Device name").to_string()
 }}
 
-dyon_fn!{fn next_events(arr: Vec<Variable>) -> Vec<InputEvent> {
-    loop {
-        let mut pfds = arr.iter().map(|var| PollFd::new(
-                with_unwrapped_device!(var, |dev : &mut Device| dev.fd()), EventFlags::POLLIN)).collect::<Vec<_>>();
-        let _ = poll(&mut pfds, -1).expect("poll()");
-        if let Some(i) = pfds.iter().position(|pfd| pfd.revents().unwrap_or(EventFlags::empty()).contains(EventFlags::POLLIN)) {
-            let evts = with_unwrapped_device!(
-                &arr[i as usize], |dev : &mut Device| dev.events().expect(".events()").collect::<Vec<_>>());
-            return evts.iter().map(|evt| InputEvent {
-                kind: evt._type as u32,
-                code: evt.code as u32,
-                value: evt.value as u32,
-                device_idx: i as u32,
-            }).collect::<Vec<_>>()
-        }
+dyon_fn!{fn next_events(arr: Vec<Variable>) -> Vec<ScriptInputEvent> {
+    let mut vec = Vec::new();
+    for var in arr.iter() {
+        with_unwrapped_device!(var, |dev: &mut Device| {
+            for ev in dev.fetch_events().unwrap() {
+                vec.push(ScriptInputEvent{
+                    kind: ev.event_type().0 as u32,
+                    code: ev.code() as u32,
+                    value: ev.value() as u32,
+                });
+            }
+        });
     }
+    return vec;
 }}
 
 dyon_fn!{fn emit_event(obj: RustObject, evt_v: Variable) -> bool {
     let mut guard = obj.lock().expect(".lock()");
-    let dev = guard.downcast_mut::<uinput::Device>().expect(".downcast_mut()");
+    let dev = guard.downcast_mut::<uinput::VirtualDevice>().expect(".downcast_mut()");
     if let Variable::Object(evt) = evt_v {
-    match (evt.get(&Arc::new("kind".into())), evt.get(&Arc::new("code".into())), evt.get(&Arc::new("value".into()))) {
+        match (evt.get(&Arc::new("kind".into())), evt.get(&Arc::new("code".into())), evt.get(&Arc::new("value".into()))) {
             (Some(&Variable::F64(kind, _)), Some(&Variable::F64(code, _)), Some(&Variable::F64(value, _))) => {
-                let mut event = raw::input_event::default();
-                event._type = kind as u16;
-                event.code = code as u16;
-                event.value = value as i32;
-                dev.write_raw(event).expect("uinput write_raw()");
+                let event = InputEvent::new(EventType(kind as u16), code as u16, value as i32);
+                dev.emit(&[event]).expect("uinput write_raw()");
                 true
             },
             x => {
@@ -162,7 +130,7 @@ dyon_fn!{fn emit_event(obj: RustObject, evt_v: Variable) -> bool {
     }
 }}
 
-fn run_script(devs: Vec<Device>, uinput: uinput::Device, script_name: &str, script: String) {
+fn run_script(devs: Vec<Device>, uinput: uinput::VirtualDevice, script_name: &str, script: String) {
     let mut module = Module::new();
     module_add!(module << device_name [Lt::Default] [Type::Any] Type::Str);
     module_add!(module << next_events [Lt::Default] [Type::Array(Box::new(Type::Any))] Type::Object);
@@ -233,13 +201,6 @@ fn main() {
         })
         .unwrap_or(Vec::new());
 
-    let uinput_path = env::var_os("EVSCRIPT_UINPUT_PATH")
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or("/dev/uinput".to_owned());
-    let ubuilder = uinput::Builder::new(&path::Path::new(&uinput_path)).expect("uinput Builder");
-
-    drop_privileges();
-
     let (script, is_expr_mode) = script_src.read();
 
     let script_conf_str = &script
@@ -247,30 +208,28 @@ fn main() {
         .take_while(|l| l.starts_with("//!"))
         .map(|l| format!("{}\n", l.trim_start_matches("//!")))
         .collect::<String>();
-    let script_conf;
+
+    let mut keys = AttributeSet::<Key>::new();
     if is_expr_mode {
-        script_conf = ScriptConfig::default();
         // Just allow all keys
-        uinput_ioctl!(ui_set_evbit(ubuilder.fd(), data::KEY.number())).expect("ioctl set_evbit");
         for i in 0..255 {
-            uinput_ioctl!(ui_set_keybit(ubuilder.fd(), i)).expect("ioctl set_keybit");
+            keys.insert(Key(i));
         }
     } else {
-        script_conf = toml::from_str(script_conf_str).expect("TOML parsing");
-        if let Some(keys) = script_conf.events.keys {
-            uinput_ioctl!(ui_set_evbit(ubuilder.fd(), data::KEY.number())).expect("ioctl set_evbit");
-            for key in keys {
-                uinput_ioctl!(ui_set_keybit(
-                    ubuilder.fd(),
-                    data::Key::from_str(&format!("KEY_{}", key)).expect("Unknown key in script config") as i32
-                )).expect("ioctl set_keybit");
+        let script_conf: ScriptConfig = toml::from_str(script_conf_str).expect("TOML parsing");
+        if let Some(str_keys) = script_conf.events.keys {
+            for key in str_keys {
+                keys.insert(Key::from_str(&format!("KEY_{}", key)).expect("Unknown key in script config"))
             }
         }
     }
 
-    let uinput = ubuilder
-        .setup(script_conf.device.unwrap_or(DeviceConfig::default()).into())
-        .expect("uinput setup()");
+    let uinput = uinput::VirtualDeviceBuilder::new().unwrap()
+        .name("Virtual keyboard")
+        .with_keys(&keys).unwrap()
+        .build().unwrap();
+
+    drop_privileges();
 
     run_script(devs, uinput, matches.value_of("FILE").unwrap_or("-"), script);
 }
