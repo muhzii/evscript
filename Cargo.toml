@@ -11,7 +11,7 @@ repository = "https://github.com/myfreeweb/evscript"
 
 [dependencies]
 clap = "2"
-rusty-sandbox = { git = "https://github.com/myfreeweb/rusty-sandbox", branch = "master" }
+rusty-sandbox = { git = "https://codeberg.org/valpackett/rusty-sandbox", branch = "trunk" }
 nix = "0"
 evdev = { git = "https://github.com/emberian/evdev", branch = "release" }
 dyon = { version = "0.46.0", default-features = false, features = ["debug_resolve"] }
